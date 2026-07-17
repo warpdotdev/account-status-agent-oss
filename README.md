@@ -14,12 +14,93 @@ After each day of customer meetings, Grainiac:
 
 The result is a living record per customer that tracks stakeholders, tech stack, requirements, use cases, deal status, follow-ups, and more — all extracted directly from meeting transcripts.
 
+## How to Deploy
+
+### With Warp (recommended)
+
+Copy and paste this prompt into [Warp](https://www.warp.dev) and follow along:
+
+```text
+Set up Grainiac: clone https://github.com/warpdotdev/account-status-agent-oss.git if it isn't already cloned, then read the grainiac-setup skill in the repo and follow its instructions.
+```
+
+The [setup skill](.agents/skills/grainiac-setup/SKILL.md) walks through everything in the manual steps below interactively: cloning, Oz CLI auth, Notion configuration, secrets, environment creation, a test run, and an optional daily schedule.
+
+### Manual setup
+
+The same steps, as a human-readable reference:
+
+1. **Set up Notion.**
+   - Create a database in Notion (or use an existing one) for account tracking.
+   - Note the title property name. Every database has exactly one title property; new databases call it `Name`, while Grainiac assumes `Company`. Rename it to `Company`, or set `GRAINIAC_NOTION_TITLE_PROPERTY` to match.
+   - Create an internal integration at https://www.notion.so/my-integrations and copy its token into `GRAINIAC_NOTION_TOKEN`.
+   - Share the database with the integration (database `⋯` menu → *Connections* → add your integration). Without this, the Notion API returns 404s.
+   - Copy the database ID from the URL — `notion.so/<workspace>/<DATABASE_ID>?v=...` — into `GRAINIAC_NOTION_DATABASE_ID`.
+
+   No other database properties are required; everything else lives in the page body, which follows the [Notion template](.agents/skills/grainiac-meeting-processor/references/notion-template.md).
+
+2. **Install and authenticate the Oz CLI.** The CLI ships with the [Warp app](https://docs.warp.dev/getting-started/installation-and-setup); otherwise see [Installing the CLI](https://docs.warp.dev/reference/cli). Then sign in:
+   ```sh
+   oz login
+   ```
+   For CI or headless environments, export an API key instead: `export WARP_API_KEY="wk-..."`.
+
+3. **Add secrets.** Warp injects team secrets into cloud runs as environment variables. Each command prompts for the value securely:
+   ```sh
+   oz secret create --team GRAINIAC_GRAIN_TOKEN
+   oz secret create --team GRAINIAC_NOTION_TOKEN
+   oz secret create --team GRAINIAC_NOTION_DATABASE_ID
+   oz secret create --team GRAINIAC_INTERNAL_DOMAIN
+   ```
+   Add `GRAINIAC_SLACK_TOKEN` and `GRAINIAC_SLACK_CHANNEL` as well if you use the Slack summary skill.
+
+4. **Create an Oz environment named `grainiac`** with this repo checked out. The orchestrator discovers the environment by this exact name, so it must match:
+   ```sh
+   oz environment create --team \
+     --name grainiac \
+     --repo <owner/repo> \
+     --docker-image warpdotdev/dev-base:latest
+   ```
+   The scripts only need the Python standard library, so the base image is enough. Copy the environment ID from the output (or `oz environment list`) for the next steps.
+
+5. **Run manually** (replace `<ENV_ID>` with your `grainiac` environment ID):
+   ```sh
+   oz agent run-cloud \
+     --environment <ENV_ID> \
+     --prompt "Read the grainiac-orchestrator skill for instructions. Process today's meetings."
+   ```
+
+6. **Schedule a daily run:**
+   ```sh
+   oz schedule create \
+     --name "Grainiac Daily" \
+     --cron "0 5 * * *" \
+     --environment <ENV_ID> \
+     --prompt "Read the grainiac-orchestrator skill for instructions. Process today's meetings."
+   ```
+   This runs at 05:00 UTC (roughly 9–10pm Pacific depending on DST).
+
+### Environment variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GRAINIAC_GRAIN_TOKEN` | Yes | Grain personal access token |
+| `GRAINIAC_NOTION_TOKEN` | Yes | Notion integration token |
+| `GRAINIAC_NOTION_DATABASE_ID` | Yes | Notion database ID for the Account Tracking database |
+| `GRAINIAC_NOTION_TITLE_PROPERTY` | No | Name of the database's title property that holds the company name (default: `Company`) |
+| `GRAINIAC_SLACK_TOKEN` | Slack skill only | Slack Bot OAuth token (xoxb-...) |
+| `GRAINIAC_SLACK_CHANNEL` | Slack skill only | Slack channel to post summaries to (e.g. `#meeting-summaries`) |
+| `GRAINIAC_INTERNAL_DOMAIN` | Recommended | Your company's email domain for filtering internal participants (e.g. `yourcompany.com`) |
+| `GRAINIAC_TIMEZONE` | No | Timezone for resolving "today" (defaults to `America/Los_Angeles`) |
+
 ## Repo Structure
 
 ```
 grainiac/
 ├── .agents/
 │   └── skills/
+│       ├── grainiac-setup/
+│       │   └── SKILL.md               # Oz skill: guided end-to-end deployment
 │       ├── grainiac-orchestrator/
 │       │   └── SKILL.md               # Oz skill for the main orchestrator agent
 │       ├── grainiac-meeting-processor/
@@ -67,72 +148,6 @@ The orchestrator supports three modes based on the prompt:
 | *(no parameters)* | Process today's meetings (Pacific time default) |
 | "Process meetings from 2026-03-10" | Process all external meetings on that date |
 | "Process Acme Corp meetings from 2026-03-10" | Process only that company's meetings on that date |
-
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `GRAINIAC_GRAIN_TOKEN` | Yes | Grain personal access token |
-| `GRAINIAC_NOTION_TOKEN` | Yes | Notion integration token |
-| `GRAINIAC_NOTION_DATABASE_ID` | Yes | Notion database ID for the Account Tracking database |
-| `GRAINIAC_NOTION_TITLE_PROPERTY` | No | Name of the database's title property that holds the company name (default: `Company`). Set this if your title property has a different name (new Notion databases default to `Name`). |
-| `GRAINIAC_SLACK_TOKEN` | Slack skill only | Slack Bot OAuth token (xoxb-...) |
-| `GRAINIAC_SLACK_CHANNEL` | Slack skill only | Slack channel to post summaries to (e.g. `#meeting-summaries`) |
-| `GRAINIAC_INTERNAL_DOMAIN` | Recommended | Your company's email domain for filtering internal participants (e.g. `yourcompany.com`). If unset, only participants Grain explicitly marks as internal are treated as internal. |
-| `GRAINIAC_TIMEZONE` | No | Timezone for resolving "today" (defaults to `America/Los_Angeles`) |
-
-## Notion Database Setup
-
-Grainiac writes one page per customer into a Notion database. Before the first run:
-
-1. **Create a database** in Notion (or use an existing one) for account tracking.
-2. **Note the title property name.** Every Notion database has exactly one title property. New databases call it `Name` by default, while Grainiac assumes `Company`. Either rename the title property to `Company`, or set `GRAINIAC_NOTION_TITLE_PROPERTY` to match your title property's name.
-3. **Create an internal integration** at https://www.notion.so/my-integrations and copy its token into `GRAINIAC_NOTION_TOKEN`.
-4. **Share the database with the integration** (database `⋯` menu → *Connections* → add your integration). Without this, the Notion API returns 404s.
-5. **Copy the database ID** from the URL — `notion.so/<workspace>/<DATABASE_ID>?v=...` — into `GRAINIAC_NOTION_DATABASE_ID`.
-
-No other database properties are required; everything else lives in the page body, which follows the structure in the [Notion template](.agents/skills/grainiac-meeting-processor/references/notion-template.md).
-
-## Setup for Oz
-
-Grainiac runs as an [Oz cloud agent](https://docs.warp.dev/reference/cli). You need the Oz CLI and an authenticated session.
-
-1. **Install and authenticate the Oz CLI.** The CLI ships with the [Warp app](https://docs.warp.dev/getting-started/installation-and-setup); otherwise see [Installing the CLI](https://docs.warp.dev/reference/cli). Then sign in:
-   ```sh
-   oz login
-   ```
-   For CI or headless environments, export an API key instead: `export WARP_API_KEY="wk-..."`.
-
-2. **Create an Oz environment named `grainiac`** with this repo checked out. The orchestrator discovers the environment by this exact name, so it must match. List environments (and copy the ID for later) with:
-   ```sh
-   oz environment list
-   ```
-
-3. **Add secrets.** Warp injects team secrets into cloud runs as environment variables. Each command prompts for the value securely:
-   ```sh
-   oz secret create --team GRAINIAC_GRAIN_TOKEN
-   oz secret create --team GRAINIAC_NOTION_TOKEN
-   oz secret create --team GRAINIAC_NOTION_DATABASE_ID
-   oz secret create --team GRAINIAC_INTERNAL_DOMAIN
-   ```
-   Add `GRAINIAC_SLACK_TOKEN` and `GRAINIAC_SLACK_CHANNEL` as well if you use the Slack summary skill. Find your Notion database ID in the database URL: `notion.so/<workspace>/<DATABASE_ID>?v=...`.
-
-4. **Run manually** (replace `<ENV_ID>` with your `grainiac` environment ID):
-   ```sh
-   oz agent run-cloud \
-     --environment <ENV_ID> \
-     --prompt "Read the grainiac-orchestrator skill for instructions. Process today's meetings."
-   ```
-
-5. **Schedule a daily run:**
-   ```sh
-   oz schedule create \
-     --name "Grainiac Daily" \
-     --cron "0 5 * * *" \
-     --environment <ENV_ID> \
-     --prompt "Read the grainiac-orchestrator skill for instructions. Process today's meetings."
-   ```
-   This runs at 05:00 UTC (roughly 9–10pm Pacific depending on DST).
 
 ## Scripts
 
