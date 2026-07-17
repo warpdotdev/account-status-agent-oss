@@ -6,9 +6,14 @@ import urllib.error
 import json
 import os
 import sys
+import time
 from datetime import datetime
 
 BASE_URL = "https://api.grain.com/_/public-api"
+
+# Retry configuration for transient rate limiting (HTTP 429).
+_MAX_RETRIES = 5
+_BASE_BACKOFF = 2.0  # seconds; exponential backoff base
 
 
 def _headers():
@@ -18,14 +23,35 @@ def _headers():
     return {"Authorization": f"Bearer {token}"}
 
 
+def _retry_after_seconds(err, attempt):
+    """Determine how long to wait before retrying a 429, honoring Retry-After."""
+    retry_after = err.headers.get("Retry-After") if err.headers else None
+    if retry_after:
+        try:
+            return float(retry_after)
+        except (TypeError, ValueError):
+            pass
+    return _BASE_BACKOFF * (2 ** attempt)
+
+
 def _get(path, timeout=30):
     url = f"{BASE_URL}{path}"
-    req = urllib.request.Request(url, headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Grain API {e.code} on GET {path}: {e.reason}") from e
+    for attempt in range(_MAX_RETRIES):
+        req = urllib.request.Request(url, headers=_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < _MAX_RETRIES - 1:
+                wait = _retry_after_seconds(e, attempt)
+                print(
+                    f"  Grain API 429 on GET {path}; retrying in {wait:.1f}s "
+                    f"(attempt {attempt + 1}/{_MAX_RETRIES})",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Grain API {e.code} on GET {path}: {e.reason}") from e
 
 
 def get_recording(recording_id, include_participants=True, include_ai_summary=False):
@@ -70,7 +96,10 @@ def list_all_recordings(include_participants=True, after_datetime=None, before_d
     """Paginate through all recordings matching the filters."""
     all_recs = []
     cursor = None
-    for _ in range(max_pages):
+    for page in range(max_pages):
+        if page > 0:
+            # Small delay between page requests to avoid tripping rate limits.
+            time.sleep(0.5)
         recs, cursor = list_recordings_page(
             cursor=cursor,
             include_participants=include_participants,
