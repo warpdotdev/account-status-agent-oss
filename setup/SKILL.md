@@ -40,7 +40,7 @@ Run:
 oz environment list
 ```
 
-- **Command not found** → the CLI ships with the [Warp app](https://docs.warp.dev/getting-started/installation-and-setup); otherwise see [Installing the CLI](https://docs.warp.dev/reference/cli).
+- **Command not found** → if the [Warp app](https://docs.warp.dev/getting-started/installation-and-setup) is already installed, the CLI ships with it. Otherwise, prefer the standalone Oz CLI — there is no need to install the full Warp app just for the CLI. See [Installing the CLI](https://docs.warp.dev/reference/cli#installing-the-cli); on macOS: `brew tap warpdotdev/warp && brew install --cask oz`.
 - **Not authenticated** → run `oz login` (interactive), or for CI/headless environments have the user export `WARP_API_KEY`.
 - **Succeeds** → note whether an environment named `grainiac` already exists (used in step 5).
 

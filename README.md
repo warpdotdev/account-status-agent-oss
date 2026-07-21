@@ -39,7 +39,7 @@ The same steps, as a human-readable reference:
 
    No other database properties are required; everything else lives in the page body, which follows the [Notion template](.agents/skills/grainiac-meeting-processor/references/notion-template.md).
 
-2. **Install and authenticate the Oz CLI.** The CLI ships with the [Warp app](https://docs.warp.dev/getting-started/installation-and-setup); otherwise see [Installing the CLI](https://docs.warp.dev/reference/cli). Then sign in:
+2. **Install and authenticate the Oz CLI.** If the [Warp app](https://docs.warp.dev/getting-started/installation-and-setup) is already installed, the CLI ships with it. Otherwise, prefer the standalone Oz CLI — there is no need to install the full Warp app just for the CLI. See [Installing the CLI](https://docs.warp.dev/reference/cli#installing-the-cli); on macOS: `brew tap warpdotdev/warp && brew install --cask oz`. Then sign in:
    ```sh
    oz login
    ```
