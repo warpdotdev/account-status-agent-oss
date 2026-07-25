@@ -6,9 +6,15 @@ import urllib.error
 import json
 import os
 import sys
+import time
 from datetime import datetime
 
 BASE_URL = "https://api.grain.com/_/public-api"
+
+# Grain rate-limits aggressively. Retry 429s with exponential backoff,
+# honoring the Retry-After header when present.
+MAX_RETRIES = 5
+BASE_BACKOFF_SECONDS = 2
 
 
 def _headers():
@@ -18,14 +24,36 @@ def _headers():
     return {"Authorization": f"Bearer {token}"}
 
 
+def _sleep_for_retry(e, attempt):
+    """Determine how long to wait before retrying a rate-limited request."""
+    retry_after = None
+    try:
+        retry_after = e.headers.get("Retry-After") if e.headers else None
+    except Exception:
+        retry_after = None
+    if retry_after:
+        try:
+            delay = float(retry_after)
+        except ValueError:
+            delay = BASE_BACKOFF_SECONDS * (2 ** attempt)
+    else:
+        delay = BASE_BACKOFF_SECONDS * (2 ** attempt)
+    print(f"  Grain API 429; backing off {delay:.0f}s (attempt {attempt + 1}/{MAX_RETRIES})", file=sys.stderr)
+    time.sleep(delay)
+
+
 def _get(path, timeout=30):
     url = f"{BASE_URL}{path}"
-    req = urllib.request.Request(url, headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Grain API {e.code} on GET {path}: {e.reason}") from e
+    for attempt in range(MAX_RETRIES):
+        req = urllib.request.Request(url, headers=_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < MAX_RETRIES - 1:
+                _sleep_for_retry(e, attempt)
+                continue
+            raise RuntimeError(f"Grain API {e.code} on GET {path}: {e.reason}") from e
 
 
 def get_recording(recording_id, include_participants=True, include_ai_summary=False):
