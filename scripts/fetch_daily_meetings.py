@@ -11,33 +11,35 @@ Outputs JSON array of meetings to stdout. Requires GRAINIAC_GRAIN_TOKEN env var.
 import sys
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Allow importing from same directory
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from grain_client import list_all_recordings, filter_external_meetings, hydrate_with_participants
 
-# Grain timestamps are UTC. When resolving "today", we need to use the
-# business timezone so that an evening Pacific run captures the right day.
-# Set via GRAINIAC_TIMEZONE env var. Default: America/Los_Angeles (Pacific).
+# Grain timestamps are UTC. When resolving "today", we use the business timezone
+# so that an evening Pacific run captures the right day. Set via the
+# GRAINIAC_TIMEZONE env var. Default: America/Los_Angeles (Pacific).
 #
-# We use a simple UTC offset lookup instead of pytz to stay stdlib-only.
-# This handles PST/PDT well enough for daily batch runs.
-TZ_OFFSETS = {
-    "America/Los_Angeles": -8,  # PST (close enough; PDT is -7)
-    "America/New_York": -5,
-    "America/Chicago": -6,
-    "America/Denver": -7,
-    "US/Pacific": -8,
-    "US/Eastern": -5,
-    "UTC": 0,
-}
+# zoneinfo is stdlib (3.9+) and applies the correct DST offset for the current
+# date. A hardcoded offset table cannot: being an hour off flips the resolved
+# date for runs in the hour around midnight local time, which would silently
+# process the wrong day.
+DEFAULT_TIMEZONE = "America/Los_Angeles"
 
 
 def _resolve_today():
-    tz_name = os.environ.get("GRAINIAC_TIMEZONE", "America/Los_Angeles")
-    offset_hours = TZ_OFFSETS.get(tz_name, -8)
-    tz = timezone(timedelta(hours=offset_hours))
+    tz_name = os.environ.get("GRAINIAC_TIMEZONE", DEFAULT_TIMEZONE) or DEFAULT_TIMEZONE
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        print(
+            f"Warning: unknown GRAINIAC_TIMEZONE {tz_name!r}; falling back to {DEFAULT_TIMEZONE}",
+            file=sys.stderr,
+        )
+        tz_name = DEFAULT_TIMEZONE
+        tz = ZoneInfo(tz_name)
     return datetime.now(tz).date(), tz_name
 
 
@@ -55,10 +57,12 @@ def main():
 
     target_str = str(target)
 
-    # Grain API date params are unreliable, so we fetch all recent recordings
-    # and filter client-side by date.
+    # Grain API date params are unreliable, so we fetch recent recordings and
+    # filter client-side by date. Recordings come back newest-first, so
+    # stop_before_date halts pagination once we walk past the target day
+    # instead of pulling the entire history and exhausting the rate limit.
     print(f"Fetching recordings for {target}...", file=sys.stderr)
-    recordings = list_all_recordings(include_participants=True)
+    recordings = list_all_recordings(include_participants=True, stop_before_date=target_str)
     print(f"Fetched {len(recordings)} total recordings", file=sys.stderr)
 
     # Filter to target date

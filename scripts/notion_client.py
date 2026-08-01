@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Notion API client. Requires GRAINIAC_NOTION_TOKEN environment variable."""
 
+import sys
 import urllib.request
 import urllib.error
 import json
@@ -8,6 +9,10 @@ import os
 
 BASE_URL = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
+
+# Cache of database_id -> actual title property name, so schema lookup happens
+# at most once per database per process.
+_title_property_cache = {}
 
 
 def _database_id():
@@ -18,11 +23,13 @@ def _database_id():
 
 
 def _title_property():
-    """Name of the database's title property (the column that holds the company name).
-    New Notion databases call this 'Name'; override via GRAINIAC_NOTION_TITLE_PROPERTY.
-    Defaults to 'Company'.
+    """Configured name of the database's title property, or None if unset.
+
+    The name varies by database ('Name', 'Company', 'Account name', ...), so this
+    is only a hint. `resolve_title_property()` reads the real name from the
+    database schema; set GRAINIAC_NOTION_TITLE_PROPERTY only to pin it.
     """
-    return os.environ.get("GRAINIAC_NOTION_TITLE_PROPERTY", "Company").strip() or "Company"
+    return os.environ.get("GRAINIAC_NOTION_TITLE_PROPERTY", "").strip() or None
 
 
 def _headers():
@@ -43,17 +50,58 @@ def _api(method, path, body=None):
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
+        if e.code == 404 and "/databases/" in path:
+            raise RuntimeError(
+                f"Notion API 404 on {method} {path}: database not found. Either "
+                f"GRAINIAC_NOTION_DATABASE_ID is wrong, or the database has not been shared "
+                f"with this integration (database '⋯' menu → Connections → add the integration). "
+                f"To see what this token can reach, POST /search with "
+                f'{{"filter": {{"value": "database", "property": "object"}}}}.'
+            ) from e
         raise RuntimeError(f"Notion API {e.code} on {method} {path}: {e.reason}") from e
 
 
 # ── Database operations ──
+
+def resolve_title_property(database_id=None, title_property=None):
+    """Return the database's actual title property name.
+
+    Every Notion database has exactly one title property, but its name varies
+    ('Name', 'Company', 'Account name', ...). Trusting a hardcoded default or a
+    stale GRAINIAC_NOTION_TITLE_PROPERTY makes queries fail with a confusing
+    validation error, so read the real name from the schema. If a name was
+    explicitly configured and disagrees, the schema wins and we warn.
+    """
+    db = database_id or _database_id()
+    if db not in _title_property_cache:
+        schema = _api("GET", f"/databases/{db}")
+        actual = next(
+            (name for name, prop in schema.get("properties", {}).items()
+             if prop.get("type") == "title"),
+            None,
+        )
+        if not actual:
+            raise RuntimeError(f"Notion database {db} has no title property")
+        _title_property_cache[db] = actual
+
+    actual = _title_property_cache[db]
+    configured = title_property or _title_property()
+    if configured and configured != actual:
+        print(
+            f"Warning: configured Notion title property {configured!r} does not match "
+            f"database {db}, which uses {actual!r}; using {actual!r}. "
+            f"Update GRAINIAC_NOTION_TITLE_PROPERTY (or unset it to auto-detect).",
+            file=sys.stderr,
+        )
+    return actual
+
 
 def find_company_page(company_name, database_id=None, title_property=None):
     """Search the database for an existing page with the given company name.
     Returns the page object or None.
     """
     db = database_id or _database_id()
-    prop = title_property or _title_property()
+    prop = resolve_title_property(db, title_property)
     result = _api("POST", f"/databases/{db}/query", {
         "filter": {"property": prop, "title": {"equals": company_name}}
     })
@@ -66,7 +114,7 @@ def create_page(company_name, children_blocks, database_id=None, title_property=
     Notion limits to 100 children per request. Returns the created page object.
     """
     db = database_id or _database_id()
-    prop = title_property or _title_property()
+    prop = resolve_title_property(db, title_property)
     return _api("POST", "/pages", {
         "parent": {"database_id": db},
         "properties": {prop: {"title": [{"text": {"content": company_name}}]}},
