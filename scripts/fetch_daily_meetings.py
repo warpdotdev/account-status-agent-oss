@@ -55,11 +55,15 @@ def main():
 
     target_str = str(target)
 
-    # Grain API date params are unreliable, so we fetch all recent recordings
-    # and filter client-side by date.
+    # Grain API date params are unreliable (afterDatetime/beforeDatetime are
+    # accepted but ignored server-side), so we fetch recent recordings and
+    # filter client-side by date. Results come back newest-first, so we stop
+    # paginating once we're past the target day instead of walking the whole
+    # archive — that unbounded walk used to blow through the API rate limit
+    # (~30 requests/min) and fail the run with HTTP 429.
     print(f"Fetching recordings for {target}...", file=sys.stderr)
-    recordings = list_all_recordings(include_participants=True)
-    print(f"Fetched {len(recordings)} total recordings", file=sys.stderr)
+    recordings = list_all_recordings(include_participants=True, stop_before_date=target_str)
+    print(f"Fetched {len(recordings)} recordings (stopped at {target})", file=sys.stderr)
 
     # Filter to target date
     day_recordings = [
