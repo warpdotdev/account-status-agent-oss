@@ -5,9 +5,19 @@ import urllib.request
 import urllib.error
 import json
 import os
+import random
+import sys
+import time
 
 BASE_URL = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
+
+# Notion allows ~3 requests/second per integration and returns HTTP 429 beyond
+# that. A batch run fans out one agent per meeting, all writing through the same
+# integration token, so requests retry with backoff rather than dropping updates.
+MAX_RETRIES = int(os.environ.get("GRAINIAC_NOTION_MAX_RETRIES", "6"))
+BASE_BACKOFF_SECONDS = float(os.environ.get("GRAINIAC_NOTION_BACKOFF_SECONDS", "1"))
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def _database_id():
@@ -36,17 +46,66 @@ def _headers():
     }
 
 
+def _retry_delay(http_error, attempt):
+    """Seconds to wait before retrying, honouring ``Retry-After`` when present."""
+    retry_after = http_error.headers.get("Retry-After") if http_error.headers else None
+    if retry_after:
+        try:
+            return max(1.0, float(retry_after))
+        except (TypeError, ValueError):
+            pass
+    return BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, 1)
+
+
 def _api(method, path, body=None):
     data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(f"{BASE_URL}{path}", data=data, headers=_headers(), method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Notion API {e.code} on {method} {path}: {e.reason}") from e
+    last_error = None
+    for attempt in range(MAX_RETRIES + 1):
+        # Rebuild the request each attempt: an unread urlopen error can leave the
+        # original Request's payload stream consumed.
+        req = urllib.request.Request(
+            f"{BASE_URL}{path}", data=data, headers=_headers(), method=method
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code not in RETRY_STATUS_CODES:
+                raise RuntimeError(f"Notion API {e.code} on {method} {path}: {e.reason}") from e
+            last_error = e
+            if attempt == MAX_RETRIES:
+                break
+            delay = _retry_delay(e, attempt)
+            print(
+                f"  Notion API {e.code} on {method} {path}; retrying in {delay:.1f}s "
+                f"(attempt {attempt + 1}/{MAX_RETRIES})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    raise RuntimeError(
+        f"Notion API {last_error.code} on {method} {path} after {MAX_RETRIES} retries: "
+        f"{last_error.reason}"
+    ) from last_error
 
 
 # ── Database operations ──
+
+def _explain_database_error(error, db):
+    """Re-raise database errors with the two causes that actually produce a 404.
+
+    Notion answers 404 both for a genuinely wrong ID and for a database the
+    integration simply hasn't been granted access to, which makes the bare
+    'Not Found' very hard to act on.
+    """
+    if "404" not in str(error):
+        raise error
+    raise RuntimeError(
+        f"Notion could not find database {db}. Either GRAINIAC_NOTION_DATABASE_ID is "
+        f"wrong, or the database has not been shared with this integration "
+        f"(database '⋯' menu → Connections → add the integration). "
+        f"Run a POST /search to list what the token can actually see."
+    ) from error
+
 
 def find_company_page(company_name, database_id=None, title_property=None):
     """Search the database for an existing page with the given company name.
@@ -54,9 +113,12 @@ def find_company_page(company_name, database_id=None, title_property=None):
     """
     db = database_id or _database_id()
     prop = title_property or _title_property()
-    result = _api("POST", f"/databases/{db}/query", {
-        "filter": {"property": prop, "title": {"equals": company_name}}
-    })
+    try:
+        result = _api("POST", f"/databases/{db}/query", {
+            "filter": {"property": prop, "title": {"equals": company_name}}
+        })
+    except RuntimeError as e:
+        _explain_database_error(e, db)
     pages = result.get("results", [])
     return pages[0] if pages else None
 
