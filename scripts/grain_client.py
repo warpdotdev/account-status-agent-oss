@@ -5,6 +5,7 @@ import urllib.request
 import urllib.error
 import json
 import os
+import random
 import sys
 import time
 from datetime import datetime
@@ -61,11 +62,13 @@ def _request(url, timeout, decode_json=True):
             try:
                 delay = int(retry_after)
             except (TypeError, ValueError):
-                delay = backoff
+                # Jitter keeps the orchestrator's per-meeting agents, which all
+                # share one token, from retrying in lockstep and re-colliding.
+                delay = backoff + random.uniform(0, 1)
             if attempt == MAX_RETRIES - 1:
                 break
             print(
-                f"  Grain API {e.code}; retrying in {delay}s "
+                f"  Grain API {e.code}; retrying in {delay:.1f}s "
                 f"(attempt {attempt + 1}/{MAX_RETRIES})",
                 file=sys.stderr,
             )
