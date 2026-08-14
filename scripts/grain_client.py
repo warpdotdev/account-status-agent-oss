@@ -6,9 +6,18 @@ import urllib.error
 import json
 import os
 import sys
+import time
 from datetime import datetime
 
 BASE_URL = "https://api.grain.com/_/public-api"
+
+# The Grain API rate limits aggressively when paginating. Requests are paced and
+# retried with exponential backoff on 429/5xx responses.
+REQUEST_INTERVAL_SECONDS = float(os.environ.get("GRAINIAC_REQUEST_INTERVAL", "1.5"))
+MAX_RETRIES = int(os.environ.get("GRAINIAC_MAX_RETRIES", "6"))
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+_last_request_time = 0.0
 
 
 def _headers():
@@ -18,14 +27,64 @@ def _headers():
     return {"Authorization": f"Bearer {token}"}
 
 
+def _throttle():
+    """Space out requests so we stay under the Grain API rate limit."""
+    global _last_request_time
+    elapsed = time.monotonic() - _last_request_time
+    if elapsed < REQUEST_INTERVAL_SECONDS:
+        time.sleep(REQUEST_INTERVAL_SECONDS - elapsed)
+    _last_request_time = time.monotonic()
+
+
+def _retry_after_seconds(error, attempt):
+    """Honor a Retry-After header when present, else exponential backoff."""
+    header = None
+    if getattr(error, "headers", None):
+        header = error.headers.get("Retry-After")
+    if header:
+        try:
+            return min(float(header), 120.0)
+        except ValueError:
+            pass
+    return min(2.0 ** attempt, 60.0)
+
+
+def _request(url, timeout, decode_json=True, description=None):
+    """Perform a GET with throttling and retries on transient failures."""
+    label = description or url
+    for attempt in range(MAX_RETRIES + 1):
+        _throttle()
+        req = urllib.request.Request(url, headers=_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read()
+                return json.loads(body) if decode_json else body.decode("utf-8")
+        except urllib.error.HTTPError as e:
+            if e.code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+                delay = _retry_after_seconds(e, attempt)
+                print(
+                    f"  Grain API {e.code} on {label}; retrying in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{MAX_RETRIES})",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"Grain API {e.code} on GET {label}: {e.reason}") from e
+        except urllib.error.URLError as e:
+            if attempt < MAX_RETRIES:
+                delay = min(2.0 ** attempt, 60.0)
+                print(
+                    f"  Network error on {label}: {e.reason}; retrying in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{MAX_RETRIES})",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"Network error on GET {label}: {e.reason}") from e
+
+
 def _get(path, timeout=30):
-    url = f"{BASE_URL}{path}"
-    req = urllib.request.Request(url, headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Grain API {e.code} on GET {path}: {e.reason}") from e
+    return _request(f"{BASE_URL}{path}", timeout, decode_json=True, description=path)
 
 
 def get_recording(recording_id, include_participants=True, include_ai_summary=False):
@@ -42,12 +101,12 @@ def get_recording(recording_id, include_participants=True, include_ai_summary=Fa
 def get_transcript_text(recording_id):
     """Fetch the full plain-text transcript for a recording."""
     url = f"{BASE_URL}/recordings/{recording_id}/transcript.txt"
-    req = urllib.request.Request(url, headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Grain API {e.code} fetching transcript for {recording_id}: {e.reason}") from e
+    return _request(
+        url,
+        timeout=60,
+        decode_json=False,
+        description=f"/recordings/{recording_id}/transcript.txt",
+    )
 
 
 def list_recordings_page(cursor=None, include_participants=True, after_datetime=None, before_datetime=None):
