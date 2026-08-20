@@ -6,9 +6,19 @@ import urllib.error
 import json
 import os
 import sys
+import time
 from datetime import datetime
 
 BASE_URL = "https://api.grain.com/_/public-api"
+
+# The Grain API rate-limits aggressively, especially while paginating.
+# Retry 429s (and transient 5xxs) with exponential backoff, honoring
+# Retry-After when the API provides it.
+MAX_RETRIES = 6
+INITIAL_BACKOFF_SECONDS = 2.0
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# Small pause between paginated requests to stay under the rate limit.
+PAGE_DELAY_SECONDS = float(os.environ.get("GRAINIAC_PAGE_DELAY", "1.0"))
 
 
 def _headers():
@@ -18,14 +28,63 @@ def _headers():
     return {"Authorization": f"Bearer {token}"}
 
 
-def _get(path, timeout=30):
-    url = f"{BASE_URL}{path}"
-    req = urllib.request.Request(url, headers=_headers())
+def _retry_after_seconds(err, attempt):
+    """Seconds to wait before the next attempt, preferring the Retry-After header."""
+    retry_after = None
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Grain API {e.code} on GET {path}: {e.reason}") from e
+        retry_after = err.headers.get("Retry-After") if err.headers else None
+    except Exception:
+        retry_after = None
+    if retry_after:
+        try:
+            return max(float(retry_after), 1.0)
+        except ValueError:
+            pass
+    return INITIAL_BACKOFF_SECONDS * (2 ** attempt)
+
+
+def _request(path, timeout, raw=False):
+    """Perform a GET with retry/backoff on rate limits and transient errors."""
+    url = f"{BASE_URL}{path}"
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        req = urllib.request.Request(url, headers=_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read()
+                return body.decode("utf-8") if raw else json.loads(body)
+        except urllib.error.HTTPError as e:
+            last_error = e
+            if e.code not in RETRYABLE_STATUS or attempt == MAX_RETRIES - 1:
+                break
+            delay = _retry_after_seconds(e, attempt)
+            print(
+                f"  Grain API {e.code} on GET {path}; retrying in {delay:.0f}s "
+                f"(attempt {attempt + 1}/{MAX_RETRIES})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+        except urllib.error.URLError as e:
+            last_error = e
+            if attempt == MAX_RETRIES - 1:
+                break
+            delay = INITIAL_BACKOFF_SECONDS * (2 ** attempt)
+            print(
+                f"  Grain API network error on GET {path}: {e.reason}; "
+                f"retrying in {delay:.0f}s (attempt {attempt + 1}/{MAX_RETRIES})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+    if isinstance(last_error, urllib.error.HTTPError):
+        raise RuntimeError(
+            f"Grain API {last_error.code} on GET {path}: {last_error.reason}"
+        ) from last_error
+    raise RuntimeError(f"Grain API request failed on GET {path}: {last_error}") from last_error
+
+
+def _get(path, timeout=30):
+    return _request(path, timeout)
 
 
 def get_recording(recording_id, include_participants=True, include_ai_summary=False):
@@ -41,13 +100,7 @@ def get_recording(recording_id, include_participants=True, include_ai_summary=Fa
 
 def get_transcript_text(recording_id):
     """Fetch the full plain-text transcript for a recording."""
-    url = f"{BASE_URL}/recordings/{recording_id}/transcript.txt"
-    req = urllib.request.Request(url, headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Grain API {e.code} fetching transcript for {recording_id}: {e.reason}") from e
+    return _request(f"/recordings/{recording_id}/transcript.txt", timeout=60, raw=True)
 
 
 def list_recordings_page(cursor=None, include_participants=True, after_datetime=None, before_datetime=None):
@@ -70,7 +123,9 @@ def list_all_recordings(include_participants=True, after_datetime=None, before_d
     """Paginate through all recordings matching the filters."""
     all_recs = []
     cursor = None
-    for _ in range(max_pages):
+    for page in range(max_pages):
+        if page > 0 and PAGE_DELAY_SECONDS > 0:
+            time.sleep(PAGE_DELAY_SECONDS)
         recs, cursor = list_recordings_page(
             cursor=cursor,
             include_participants=include_participants,
@@ -117,7 +172,9 @@ def hydrate_with_participants(recordings):
     Fetch each recording individually to get participant data.
     """
     hydrated = []
-    for r in recordings:
+    for i, r in enumerate(recordings):
+        if i > 0 and PAGE_DELAY_SECONDS > 0:
+            time.sleep(PAGE_DELAY_SECONDS)
         try:
             full = get_recording(r["id"], include_participants=True)
             # Merge participant data into the original record
