@@ -16,12 +16,33 @@ BASE_URL = "https://api.grain.com/_/public-api"
 MAX_RETRIES = 5
 INITIAL_BACKOFF_SECONDS = 5
 
+# Retrying on 429 recovers, but a busy day (one hydration request per recording)
+# can outrun the budget and pay a failed request plus backoff for each overage.
+# Responses carry the remaining budget, so pause before spending the last of it.
+RATE_LIMIT_FLOOR = 2
+RATE_LIMIT_COOLDOWN_SECONDS = 20  # observed window refill time
+
 
 def _headers():
     token = os.environ.get("GRAINIAC_GRAIN_TOKEN")
     if not token:
         raise RuntimeError("GRAINIAC_GRAIN_TOKEN environment variable is required")
     return {"Authorization": f"Bearer {token}"}
+
+
+def _throttle_if_budget_low(headers):
+    """Pause when the remaining rate-limit budget is nearly spent."""
+    try:
+        remaining = int(headers.get("x-ratelimit-remaining"))
+    except (TypeError, ValueError):
+        return  # header absent or malformed; rely on 429 retries instead
+    if remaining <= RATE_LIMIT_FLOOR:
+        print(
+            f"  Grain rate limit nearly exhausted ({remaining} left); "
+            f"pausing {RATE_LIMIT_COOLDOWN_SECONDS}s",
+            file=sys.stderr,
+        )
+        time.sleep(RATE_LIMIT_COOLDOWN_SECONDS)
 
 
 def _request_with_retry(url, timeout):
@@ -36,7 +57,9 @@ def _request_with_retry(url, timeout):
         req = urllib.request.Request(url, headers=_headers())
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
+                body = resp.read()
+                _throttle_if_budget_low(resp.headers)
+                return body
         except urllib.error.HTTPError as e:
             last_error = e
             if e.code != 429 and e.code < 500:
