@@ -199,3 +199,7 @@ The template that defines the structure of each customer's Notion page lives at 
 - POC / Pilot Tracker
 - Communication preferences
 - Sentiment & Relationship Notes
+
+## License
+
+MIT — see [LICENSE](LICENSE) for details.
