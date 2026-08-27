@@ -15,7 +15,11 @@ from datetime import datetime, timedelta, timezone
 
 # Allow importing from same directory
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
-from grain_client import list_all_recordings, filter_external_meetings, hydrate_with_participants
+from grain_client import (
+    list_recordings_on_date,
+    filter_external_meetings,
+    hydrate_with_participants,
+)
 
 # Grain timestamps are UTC. When resolving "today", we need to use the
 # business timezone so that an evening Pacific run captures the right day.
@@ -55,17 +59,12 @@ def main():
 
     target_str = str(target)
 
-    # Grain API date params are unreliable, so we fetch all recent recordings
-    # and filter client-side by date.
+    # Grain API date params are unreliable, so we filter client-side by date.
+    # Results come back newest-first, so we stop paging once we walk past the
+    # target day instead of pulling the whole archive (which trips the API's
+    # request rate limit).
     print(f"Fetching recordings for {target}...", file=sys.stderr)
-    recordings = list_all_recordings(include_participants=True)
-    print(f"Fetched {len(recordings)} total recordings", file=sys.stderr)
-
-    # Filter to target date
-    day_recordings = [
-        r for r in recordings
-        if r.get("start_datetime", "")[:10] == target_str
-    ]
+    day_recordings = list_recordings_on_date(target_str, include_participants=True)
     print(f"Found {len(day_recordings)} recordings on {target}", file=sys.stderr)
 
     # List endpoint doesn't return participants — hydrate each recording individually

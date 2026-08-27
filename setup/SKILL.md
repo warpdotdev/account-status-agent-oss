@@ -53,7 +53,7 @@ Confirm with the user that they have (or help them create):
 3. **Notion integration** — created at https://www.notion.so/my-integrations; they need its token.
 4. **Database shared with the integration** — database `⋯` menu → *Connections* → add the integration. Without this the Notion API returns 404s.
 5. **Database ID** — from the database URL: `notion.so/<workspace>/<DATABASE_ID>?v=...`.
-6. **Title property name** — every Notion database has exactly one title property. Grainiac assumes it is named `Company`; new Notion databases default to `Name`. Ask the user which name theirs uses: either they rename it to `Company`, or set `GRAINIAC_NOTION_TITLE_PROPERTY` in step 4.
+6. **Title property name** — every Notion database has exactly one title property. Grainiac assumes it is named `Company`; new Notion databases default to `Name`. Ask the user which name theirs uses: either they rename it to `Company`, or set `GRAINIAC_NOTION_TITLE_PROPERTY` in step 4. A mismatch is not fatal — the client auto-detects the real title property and warns — but setting it correctly avoids the extra lookup.
 7. **Internal email domain** (recommended) — e.g. `yourcompany.com`, used to separate internal vs. external meeting participants.
 8. **Slack bot token and channel** (optional) — only if they want the `grainiac-slack-summary` skill.
 
@@ -153,7 +153,8 @@ Verify with `oz schedule list`.
 
 ## Troubleshooting
 
-- **Notion API returns 404** → the database was not shared with the integration (step 3.4).
+- **Notion API returns 404** → either `GRAINIAC_NOTION_DATABASE_ID` is wrong/stale, or the database was not shared with the integration (step 3.4). Verify with `curl -H "Authorization: Bearer $GRAINIAC_NOTION_TOKEN" -H 'Notion-Version: 2022-06-28' https://api.notion.com/v1/databases/$GRAINIAC_NOTION_DATABASE_ID`, and list what the integration can actually see with a `POST /v1/search` for objects of type `database`.
 - **Company pages not created / title errors** → the database's title property name does not match; set `GRAINIAC_NOTION_TITLE_PROPERTY` (step 3.6).
+- **Grain API returns 429** → rate limited (30 requests per window). Requests already retry with backoff; raise `GRAINIAC_GRAIN_COOLDOWN` if a very busy day still trips it.
 - **"Today" resolves to the wrong date** → set `GRAINIAC_TIMEZONE` (default `America/Los_Angeles`).
 - **Local script testing** → copy `.env.example` to `.env`, fill it in, and export with `set -a; source .env; set +a`.
