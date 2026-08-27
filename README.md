@@ -32,7 +32,7 @@ The same steps, as a human-readable reference:
 
 1. **Set up Notion.**
    - Create a database in Notion (or use an existing one) for account tracking.
-   - Note the title property name. Every database has exactly one title property; new databases call it `Name`, while Grainiac assumes `Company`. Rename it to `Company`, or set `GRAINIAC_NOTION_TITLE_PROPERTY` to match.
+   - Note the title property name. Every database has exactly one title property; new databases call it `Name`, while Grainiac assumes `Company`. Rename it to `Company`, or set `GRAINIAC_NOTION_TITLE_PROPERTY` to match. If the configured name doesn't exist, Grainiac detects the database's real title property and warns on stderr rather than failing.
    - Create an internal integration at https://www.notion.so/my-integrations and copy its token into `GRAINIAC_NOTION_TOKEN`.
    - Share the database with the integration (database `⋯` menu → *Connections* → add your integration). Without this, the Notion API returns 404s.
    - Copy the database ID from the URL — `notion.so/<workspace>/<DATABASE_ID>?v=...` — into `GRAINIAC_NOTION_DATABASE_ID`.
@@ -87,7 +87,7 @@ The same steps, as a human-readable reference:
 | `GRAINIAC_GRAIN_TOKEN` | Yes | Grain personal access token |
 | `GRAINIAC_NOTION_TOKEN` | Yes | Notion integration token |
 | `GRAINIAC_NOTION_DATABASE_ID` | Yes | Notion database ID for the Account Tracking database |
-| `GRAINIAC_NOTION_TITLE_PROPERTY` | No | Name of the database's title property that holds the company name (default: `Company`) |
+| `GRAINIAC_NOTION_TITLE_PROPERTY` | No | Name of the database's title property that holds the company name (default: `Company`; auto-detected if it doesn't match) |
 | `GRAINIAC_SLACK_TOKEN` | Slack skill only | Slack Bot OAuth token (xoxb-...) |
 | `GRAINIAC_SLACK_CHANNEL` | Slack skill only | Slack channel to post summaries to (e.g. `#meeting-summaries`) |
 | `GRAINIAC_INTERNAL_DOMAIN` | Recommended | Your company's email domain for filtering internal participants (e.g. `yourcompany.com`) |
@@ -169,14 +169,21 @@ Importable Grain API client:
 - `get_recording(id)` — fetch recording metadata and participants
 - `get_transcript_text(id)` — fetch full plain-text transcript
 - `list_all_recordings()` — paginate through all recordings
+- `list_recordings_on_date(date)` — paginate only as far back as a given date (preferred; results are newest-first)
 - `hydrate_with_participants(recordings)` — enrich list results with per-recording participant data
 - `filter_external_meetings(recordings)` — filter to external-only, identify company names
+
+The Grain API is rate limited (observed limit: 30 requests per window). Every request
+retries with backoff on HTTP 429/5xx, honoring `Retry-After`, and pauses when the
+reported remaining-request budget runs low. Override the cooldown with
+`GRAINIAC_GRAIN_COOLDOWN` (seconds, default 20).
 
 ### `scripts/notion_client.py`
 
 Importable Notion API client:
 - `find_company_page(name)` — check if a company page exists
 - `create_page(name, blocks)` — create a new page in the database
+- `resolve_title_property()` — resolve the database's real title property name (cached)
 - `get_all_blocks(page_id)` — get all blocks from a page
 - `append_blocks(parent_id, blocks, after=)` — insert blocks at a specific position
 - `update_block(block_id, data)` — update a block's content

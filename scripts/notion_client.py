@@ -5,6 +5,7 @@ import urllib.request
 import urllib.error
 import json
 import os
+import sys
 
 BASE_URL = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
@@ -43,17 +44,81 @@ def _api(method, path, body=None):
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Notion API {e.code} on {method} {path}: {e.reason}") from e
+        detail = ""
+        try:
+            detail = json.loads(e.read() or b"{}").get("message", "")
+        except (ValueError, OSError):
+            pass
+        hint = ""
+        if e.code == 404:
+            hint = (
+                " — the ID is wrong, or the page/database has not been shared with "
+                "the Notion integration. Check GRAINIAC_NOTION_DATABASE_ID and the "
+                "integration's access (Notion: ... menu > Connections)."
+            )
+        raise RuntimeError(
+            f"Notion API {e.code} on {method} {path}: {e.reason}"
+            f"{f' ({detail})' if detail else ''}{hint}"
+        ) from e
 
 
 # ── Database operations ──
+
+def get_database(database_id=None):
+    """Fetch a database object (schema included)."""
+    return _api("GET", f"/databases/{database_id or _database_id()}")
+
+
+_resolved_title_props = {}
+
+
+def resolve_title_property(database_id=None, title_property=None):
+    """Return the database's actual title property name.
+
+    Every Notion database has exactly one title property, but its name varies
+    ('Company', 'Name', 'Account name', ...). Rather than failing with an opaque
+    validation error when the configured name is wrong, look up the real one and
+    warn. Results are cached per database.
+    """
+    db = database_id or _database_id()
+    configured = title_property or _title_property()
+
+    cached = _resolved_title_props.get(db)
+    if cached:
+        return cached
+
+    try:
+        schema = get_database(db).get("properties", {})
+    except RuntimeError as e:
+        # Can't introspect (e.g. 404/permissions) — let the caller's own request
+        # surface the real error instead of masking it here.
+        print(f"  Warning: could not read database schema: {e}", file=sys.stderr)
+        return configured
+
+    if schema.get(configured, {}).get("type") == "title":
+        _resolved_title_props[db] = configured
+        return configured
+
+    actual = next((n for n, p in schema.items() if p.get("type") == "title"), None)
+    if not actual:
+        raise RuntimeError(f"Notion database {db} has no title property")
+
+    print(
+        f"  Warning: configured title property {configured!r} is not this "
+        f"database's title property; using {actual!r} instead. Set "
+        f"GRAINIAC_NOTION_TITLE_PROPERTY={actual!r} to silence this.",
+        file=sys.stderr,
+    )
+    _resolved_title_props[db] = actual
+    return actual
+
 
 def find_company_page(company_name, database_id=None, title_property=None):
     """Search the database for an existing page with the given company name.
     Returns the page object or None.
     """
     db = database_id or _database_id()
-    prop = title_property or _title_property()
+    prop = resolve_title_property(db, title_property)
     result = _api("POST", f"/databases/{db}/query", {
         "filter": {"property": prop, "title": {"equals": company_name}}
     })
@@ -66,7 +131,7 @@ def create_page(company_name, children_blocks, database_id=None, title_property=
     Notion limits to 100 children per request. Returns the created page object.
     """
     db = database_id or _database_id()
-    prop = title_property or _title_property()
+    prop = resolve_title_property(db, title_property)
     return _api("POST", "/pages", {
         "parent": {"database_id": db},
         "properties": {prop: {"title": [{"text": {"content": company_name}}]}},
