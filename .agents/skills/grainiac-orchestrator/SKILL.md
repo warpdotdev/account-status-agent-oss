@@ -61,17 +61,47 @@ First, discover the environment ID by looking up the "grainiac" environment:
 oz environment list --output-format json | python3 -c "import sys,json; envs=json.load(sys.stdin); print(next(e['id'] for e in envs if e['name']=='grainiac'))"
 ```
 
-Then spawn each child agent using that environment ID:
+**Secrets must be attached to each child run explicitly.** They are not inherited
+from the orchestrator's run and are not injected automatically just because the
+child uses the `grainiac` environment. A child spawned without them starts with no
+`GRAINIAC_*` variables and cannot reach Grain or Notion.
+
+Neither `oz agent run-cloud` nor its `--file` config supports a `secrets` key, so
+spawn children through the REST API, which does. `WARP_API_KEY` is available in the
+agent environment:
 
 ```sh
-oz agent run-cloud \
-  --prompt 'Read the grainiac-meeting-processor skill in this repo for instructions. Process this meeting:
-RECORDING_ID: <recording_id>
-COMPANY: <company_name>
-GRAIN_URL: <grain_url>
-MEETING_TITLE: <title>
-MEETING_DATE: <date>' \
-  --environment <ENV_ID>
+curl -sL -X POST https://app.warp.dev/api/v1/agent/run \
+  --header "Authorization: Bearer $WARP_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "prompt": "Read the grainiac-meeting-processor skill in this repo for instructions. Process this meeting:\nRECORDING_ID: <recording_id>\nCOMPANY: <company_name>\nGRAIN_URL: <grain_url>\nMEETING_TITLE: <title>\nMEETING_DATE: <date>",
+    "title": "Grainiac: <title>",
+    "config": {
+      "name": "grainiac-meeting-processor",
+      "environment_id": "<ENV_ID>",
+      "secrets": [
+        {"name": "GRAINIAC_GRAIN_TOKEN"},
+        {"name": "GRAINIAC_NOTION_TOKEN"},
+        {"name": "GRAINIAC_NOTION_DATABASE_ID"},
+        {"name": "GRAINIAC_INTERNAL_DOMAIN"},
+        {"name": "GRAINIAC_NOTION_TITLE_PROPERTY"}
+      ]
+    }
+  }'
+```
+
+The response contains the child's `run_id`. Only reference secret *names* — never
+put a secret value in a prompt or a message to another agent.
+
+For many meetings, script this loop rather than issuing one `curl` per meeting by
+hand.
+
+To confirm a child was configured correctly, check that `agent_config.secrets` is
+populated:
+
+```sh
+oz run get <run-id> --output-format json
 ```
 
 ### 4. Monitor
@@ -81,11 +111,17 @@ After spawning all child agents, list their run IDs and report a summary:
 - Number of child agents spawned
 - Company names and meeting titles for each
 
-Check run status in the Oz web app at https://oz.warp.dev/runs (each `oz agent run-cloud` invocation also prints its run ID).
+Poll the children to completion with `oz run get <run-id> --output-format json` and
+report each one's final `state` and `status_message`, so a child that fails or
+blocks is not silently dropped. Children spawned via the REST API are not part of
+your agent family and cannot message you — polling is how you learn their results.
+
+Run status is also visible in the Oz web app at https://oz.warp.dev/runs.
 
 ## Notes
 
 - **Timezone handling:** Grain timestamps are UTC. When the script resolves `today`, it uses the `GRAINIAC_TIMEZONE` env var (default: `America/Los_Angeles`) to determine the correct calendar date. This matters for evening Pacific runs where UTC has already rolled to the next day. You can override with `GRAINIAC_TIMEZONE=UTC` or any supported timezone. When a specific `YYYY-MM-DD` date is provided, the script matches recordings whose UTC `start_datetime` falls on that calendar date.
 - The Grain API's `title_search` parameter does not filter server-side. Filtering happens client-side in `grain_client.py`.
+- The Grain API also ignores `afterDatetime`/`beforeDatetime`, but it returns recordings newest-first, so `list_all_recordings(stop_before_datetime=...)` stops paging once it reaches the day before the target. Grain rate-limits aggressively; `grain_client.py` retries 429s with backoff.
 - Company names are inferred from external participant email domains. If the inferred name is wrong (e.g., "Gmail" for a personal email), the child agent should correct it during analysis.
 - The Grain API paginates at 20 recordings per page. For busy days, the fetch script handles up to 100 pages automatically.

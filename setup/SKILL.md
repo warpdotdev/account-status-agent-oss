@@ -62,8 +62,13 @@ No database properties are required beyond the title; page content follows
 
 ## 4. Create secrets
 
-Warp injects team secrets into cloud runs as environment variables. Check what
-already exists:
+Team secrets are injected into a cloud run as environment variables only when that
+run's config references them by name — they are not attached to every run
+automatically, and a child agent does not inherit its parent's secrets. Step 7
+covers attaching them to the daily scheduled run, and the `grainiac-orchestrator`
+skill covers attaching them to the per-meeting child runs it spawns.
+
+Check what already exists:
 
 ```sh
 oz secret list --output-format json
@@ -90,6 +95,8 @@ oz secret create --team GRAINIAC_SLACK_CHANNEL          # Slack summary skill on
 
 Some of these (database ID, domain, channel) are not sensitive, but they are stored
 as secrets because that is how values get injected into cloud runs.
+
+Note the exact names you create; every run that needs them must list them.
 
 ## 5. Create the `grainiac` environment
 
@@ -149,10 +156,21 @@ oz schedule create \
   --prompt "Read the grainiac-orchestrator skill for instructions. Process today's meetings."
 ```
 
+The scheduled run needs the `GRAINIAC_*` secrets attached to it, or the orchestrator
+starts with no credentials. Confirm they are attached by inspecting a run:
+
+```sh
+oz schedule get <schedule-id> --output-format json   # shows agent_config
+oz run get <run-id> --output-format json             # agent_config.secrets
+```
+
+If `secrets` is empty, attach them in the schedule's configuration in the Warp UI.
+
 Verify with `oz schedule list`.
 
 ## Troubleshooting
 
+- **Agent reports the `GRAINIAC_*` env vars are missing** → that run's config does not reference the secrets. Check `oz run get <run-id> --output-format json` for a populated `agent_config.secrets` (step 7).
 - **Notion API returns 404** → the database was not shared with the integration (step 3.4).
 - **Company pages not created / title errors** → the database's title property name does not match; set `GRAINIAC_NOTION_TITLE_PROPERTY` (step 3.6).
 - **"Today" resolves to the wrong date** → set `GRAINIAC_TIMEZONE` (default `America/Los_Angeles`).
