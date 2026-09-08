@@ -66,8 +66,20 @@ def list_recordings_page(cursor=None, include_participants=True, after_datetime=
     return data.get("recordings", []), data.get("cursor")
 
 
-def list_all_recordings(include_participants=True, after_datetime=None, before_datetime=None, max_pages=100):
-    """Paginate through all recordings matching the filters."""
+def list_all_recordings(
+    include_participants=True,
+    after_datetime=None,
+    before_datetime=None,
+    max_pages=100,
+    stop_before_date=None,
+):
+    """Paginate through all recordings matching the filters.
+
+    Recordings are returned in reverse-chronological order. When
+    `stop_before_date` (a 'YYYY-MM-DD' string) is supplied, pagination stops
+    once an entire page predates that day. A single-day lookup then costs a
+    couple of requests instead of walking the whole account history.
+    """
     all_recs = []
     cursor = None
     for _ in range(max_pages):
@@ -80,6 +92,10 @@ def list_all_recordings(include_participants=True, after_datetime=None, before_d
         all_recs.extend(recs)
         if not cursor or not recs:
             break
+        if stop_before_date:
+            dates = [r.get("start_datetime", "")[:10] for r in recs if r.get("start_datetime")]
+            if dates and all(d < stop_before_date for d in dates):
+                break
     return all_recs
 
 
