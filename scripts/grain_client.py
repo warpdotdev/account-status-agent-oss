@@ -6,9 +6,17 @@ import urllib.error
 import json
 import os
 import sys
+import time
 from datetime import datetime
 
 BASE_URL = "https://api.grain.com/_/public-api"
+
+# Grain rate-limits bursts of requests. Retry 429s (and transient 5xx) with
+# exponential backoff rather than aborting the whole run.
+MAX_RETRIES = 6
+INITIAL_BACKOFF_SECONDS = 5
+MAX_BACKOFF_SECONDS = 120
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def _headers():
@@ -18,12 +26,41 @@ def _headers():
     return {"Authorization": f"Bearer {token}"}
 
 
-def _get(path, timeout=30):
-    url = f"{BASE_URL}{path}"
-    req = urllib.request.Request(url, headers=_headers())
+def _retry_after_seconds(err, fallback):
+    """Honor a Retry-After header when the server sends one."""
+    raw = err.headers.get("Retry-After") if err.headers else None
+    if not raw:
+        return fallback
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
+        return max(float(raw), fallback)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _request(url, timeout, decode):
+    """Issue a GET with retry/backoff on rate limits and transient errors."""
+    backoff = INITIAL_BACKOFF_SECONDS
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(url, headers=_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return decode(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code not in RETRY_STATUS_CODES or attempt == MAX_RETRIES:
+                raise
+            delay = _retry_after_seconds(e, backoff)
+            print(
+                f"  Grain API {e.code}; retrying in {delay:.0f}s "
+                f"(attempt {attempt + 1}/{MAX_RETRIES})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+            backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+
+
+def _get(path, timeout=30):
+    try:
+        return _request(f"{BASE_URL}{path}", timeout, json.loads)
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"Grain API {e.code} on GET {path}: {e.reason}") from e
 
@@ -42,10 +79,8 @@ def get_recording(recording_id, include_participants=True, include_ai_summary=Fa
 def get_transcript_text(recording_id):
     """Fetch the full plain-text transcript for a recording."""
     url = f"{BASE_URL}/recordings/{recording_id}/transcript.txt"
-    req = urllib.request.Request(url, headers=_headers())
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.read().decode("utf-8")
+        return _request(url, 60, lambda raw: raw.decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"Grain API {e.code} fetching transcript for {recording_id}: {e.reason}") from e
 
@@ -112,12 +147,16 @@ def identify_company_from_participants(participants):
     return company, external
 
 
-def hydrate_with_participants(recordings):
+def hydrate_with_participants(recordings, delay_seconds=0.5):
     """The list endpoint doesn't return participants reliably.
     Fetch each recording individually to get participant data.
+
+    Requests are spaced out by `delay_seconds` to stay under Grain's rate limit.
     """
     hydrated = []
-    for r in recordings:
+    for i, r in enumerate(recordings):
+        if i and delay_seconds:
+            time.sleep(delay_seconds)
         try:
             full = get_recording(r["id"], include_participants=True)
             # Merge participant data into the original record
@@ -128,7 +167,7 @@ def hydrate_with_participants(recordings):
             if not r.get("summary"):
                 r["summary"] = full.get("summary", "")
         except Exception as e:
-            print(f"  Warning: failed to hydrate {r['id']}: {e}", file=__import__('sys').stderr)
+            print(f"  Warning: failed to hydrate {r['id']}: {e}", file=sys.stderr)
             r["participants"] = []
         hydrated.append(r)
     return hydrated

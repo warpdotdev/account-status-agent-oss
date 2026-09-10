@@ -61,7 +61,32 @@ First, discover the environment ID by looking up the "grainiac" environment:
 oz environment list --output-format json | python3 -c "import sys,json; envs=json.load(sys.stdin); print(next(e['id'] for e in envs if e['name']=='grainiac'))"
 ```
 
-Then spawn each child agent using that environment ID:
+**Child agents must be dispatched with `--agent`, or they will have no credentials.**
+The `GRAINIAC_*` values are attached to *agent configurations*, not to the `grainiac`
+environment, and they are not reliably injected into runs dispatched from the CLI.
+A child without them fails immediately with
+`GRAINIAC_GRAIN_TOKEN environment variable is required`.
+
+Look up the `grainiac-meeting-processor` agent, which carries all five secrets:
+
+```sh
+oz agent list --output-format json | python3 -c "import sys,json; a=json.load(sys.stdin); print(next(x['uid'] for x in a if x['name']=='grainiac-meeting-processor'))"
+```
+
+If that agent does not exist yet, create it once:
+
+```sh
+oz agent create --name grainiac-meeting-processor \
+  --description 'Processes a single Grain meeting into the Account Tracking Notion database.' \
+  --environment <ENV_ID> \
+  --secret GRAINIAC_GRAIN_TOKEN \
+  --secret GRAINIAC_NOTION_TOKEN \
+  --secret GRAINIAC_NOTION_DATABASE_ID \
+  --secret GRAINIAC_INTERNAL_DOMAIN \
+  --secret GRAINIAC_NOTION_TITLE_PROPERTY
+```
+
+Then spawn each child agent using that agent UID and environment ID:
 
 ```sh
 oz agent run-cloud \
@@ -71,8 +96,14 @@ COMPANY: <company_name>
 GRAIN_URL: <grain_url>
 MEETING_TITLE: <title>
 MEETING_DATE: <date>' \
-  --environment <ENV_ID>
+  --environment <ENV_ID> \
+  --agent <AGENT_UID> \
+  --parent-run-id <THIS_RUN_ID> \
+  --title 'Grainiac: <company_name> — <title>'
 ```
+
+Passing `--parent-run-id` tracks the children under this run so you can poll them
+with `oz run get <run_id>` and message them if they need to be stopped.
 
 ### 4. Monitor
 
