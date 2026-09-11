@@ -21,10 +21,14 @@ from grain_client import list_all_recordings, filter_external_meetings, hydrate_
 # business timezone so that an evening Pacific run captures the right day.
 # Set via GRAINIAC_TIMEZONE env var. Default: America/Los_Angeles (Pacific).
 #
-# We use a simple UTC offset lookup instead of pytz to stay stdlib-only.
-# This handles PST/PDT well enough for daily batch runs.
+# zoneinfo is stdlib (3.9+) and handles DST correctly. A fixed-offset table
+# would silently pick the wrong calendar date for late-evening runs during
+# daylight saving time.
+DEFAULT_TIMEZONE = "America/Los_Angeles"
+
+# Fallback offsets, used only if the system lacks a tz database.
 TZ_OFFSETS = {
-    "America/Los_Angeles": -8,  # PST (close enough; PDT is -7)
+    "America/Los_Angeles": -8,
     "America/New_York": -5,
     "America/Chicago": -6,
     "America/Denver": -7,
@@ -35,9 +39,19 @@ TZ_OFFSETS = {
 
 
 def _resolve_today():
-    tz_name = os.environ.get("GRAINIAC_TIMEZONE", "America/Los_Angeles")
-    offset_hours = TZ_OFFSETS.get(tz_name, -8)
-    tz = timezone(timedelta(hours=offset_hours))
+    tz_name = os.environ.get("GRAINIAC_TIMEZONE", DEFAULT_TIMEZONE)
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        offset_hours = TZ_OFFSETS.get(tz_name, -8)
+        tz = timezone(timedelta(hours=offset_hours))
+        print(
+            f"Warning: no tz database entry for {tz_name}; "
+            f"falling back to fixed UTC{offset_hours:+d} offset",
+            file=sys.stderr,
+        )
     return datetime.now(tz).date(), tz_name
 
 
@@ -55,10 +69,13 @@ def main():
 
     target_str = str(target)
 
-    # Grain API date params are unreliable, so we fetch all recent recordings
-    # and filter client-side by date.
+    # The Grain API accepts afterDatetime/beforeDatetime but ignores them, so we
+    # fetch recent recordings and filter client-side by date. Results come back
+    # newest-first, so `stop_before_date` lets us stop paginating as soon as we
+    # pass the target day instead of walking the whole history (which blows the
+    # API's small rate-limit budget).
     print(f"Fetching recordings for {target}...", file=sys.stderr)
-    recordings = list_all_recordings(include_participants=True)
+    recordings = list_all_recordings(include_participants=True, stop_before_date=target_str)
     print(f"Fetched {len(recordings)} total recordings", file=sys.stderr)
 
     # Filter to target date
