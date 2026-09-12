@@ -61,18 +61,42 @@ First, discover the environment ID by looking up the "grainiac" environment:
 oz environment list --output-format json | python3 -c "import sys,json; envs=json.load(sys.stdin); print(next(e['id'] for e in envs if e['name']=='grainiac'))"
 ```
 
-Then spawn each child agent using that environment ID:
+Then spawn each child agent using that environment ID.
+
+**Important:** team secrets are attached per run and are *not* inherited by child
+runs. A child spawned without an explicit secrets list starts with `secrets: []`
+and fails immediately with "GRAINIAC_GRAIN_TOKEN environment variable is
+required", no matter which environment it runs in. `oz agent run-cloud` has no
+flag for this (its `--file` config rejects a `secrets` key), so spawn children
+through the REST API, which accepts `config.secrets`:
 
 ```sh
-oz agent run-cloud \
-  --prompt 'Read the grainiac-meeting-processor skill in this repo for instructions. Process this meeting:
-RECORDING_ID: <recording_id>
-COMPANY: <company_name>
-GRAIN_URL: <grain_url>
-MEETING_TITLE: <title>
-MEETING_DATE: <date>' \
-  --environment <ENV_ID>
+curl -sS -L -X POST https://app.warp.dev/api/v1/agent/run \
+  --header "Authorization: Bearer $WARP_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "prompt": "Read the grainiac-meeting-processor skill in this repo for instructions. Process this meeting:\nRECORDING_ID: <recording_id>\nCOMPANY: <company_name>\nGRAIN_URL: <grain_url>\nMEETING_TITLE: <title>\nMEETING_DATE: <date>",
+    "title": "Grainiac: <company_name>",
+    "parent_run_id": "<YOUR_RUN_ID>",
+    "config": {
+      "environment_id": "<ENV_ID>",
+      "secrets": [
+        {"name": "GRAINIAC_GRAIN_TOKEN"},
+        {"name": "GRAINIAC_NOTION_TOKEN"},
+        {"name": "GRAINIAC_NOTION_DATABASE_ID"},
+        {"name": "GRAINIAC_INTERNAL_DOMAIN"},
+        {"name": "GRAINIAC_NOTION_TITLE_PROPERTY"}
+      ]
+    }
+  }'
 ```
+
+Only secret *names* are sent; values are resolved server-side and injected into
+the child's environment. Never pass token values in a prompt or a message.
+
+Verify a child was configured correctly with
+`oz run get <run-id> --output-format json` — its `agent_config.secrets` should
+list the five names above rather than being empty.
 
 ### 4. Monitor
 
