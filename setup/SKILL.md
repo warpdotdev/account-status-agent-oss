@@ -91,6 +91,12 @@ oz secret create --team GRAINIAC_SLACK_CHANNEL          # Slack summary skill on
 Some of these (database ID, domain, channel) are not sensitive, but they are stored
 as secrets because that is how values get injected into cloud runs.
 
+Creating a secret only makes it *available* to the team — it does not attach it to
+anything. Each run must name the secrets it needs, and child runs do not inherit
+them from their parent. Attach them to the scheduled run in the Oz web app (the
+`oz schedule create` and `oz agent run-cloud` commands have no flag for this), and
+see step 3 of the `grainiac-orchestrator` skill for how child agents get them.
+
 ## 5. Create the `grainiac` environment
 
 The orchestrator discovers the environment by the exact name `grainiac`, so the name
@@ -153,6 +159,7 @@ Verify with `oz schedule list`.
 
 ## Troubleshooting
 
+- **`GRAINIAC_GRAIN_TOKEN environment variable is required`** → the run has no secrets attached. Check with `oz run get <run-id> --output-format json`: if `agent_config.secrets` is empty, the secrets were never attached to that run (see step 4).
 - **Notion API returns 404** → the database was not shared with the integration (step 3.4).
 - **Company pages not created / title errors** → the database's title property name does not match; set `GRAINIAC_NOTION_TITLE_PROPERTY` (step 3.6).
 - **"Today" resolves to the wrong date** → set `GRAINIAC_TIMEZONE` (default `America/Los_Angeles`).
