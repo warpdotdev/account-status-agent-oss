@@ -55,24 +55,74 @@ If there is only **one meeting** to process, handle it inline instead of spawnin
 
 If there are **multiple meetings**, spawn a child cloud agent for each one.
 
-First, discover the environment ID by looking up the "grainiac" environment:
+> **Secrets do not come from the environment.** Attaching the `grainiac`
+> environment gives a child the repo, but *not* the `GRAINIAC_*` credentials.
+> Oz injects team secrets only when they are listed on the run's **agent
+> config** (`agent_config.secrets`). A child spawned with just `--prompt` and
+> `--environment` starts with `secrets: []` and immediately blocks with
+> "GRAINIAC_GRAIN_TOKEN environment variable is required".
+>
+> Always spawn children with `--agent <AGENT_UID>`, pointing at an agent config
+> that carries the secrets. Never work around this by passing credential values
+> in a prompt or message — that writes live tokens into agent logs.
+
+First, discover the environment ID and the agent config that carries the secrets:
 
 ```sh
 oz environment list --output-format json | python3 -c "import sys,json; envs=json.load(sys.stdin); print(next(e['id'] for e in envs if e['name']=='grainiac'))"
+
+oz agent list --output-format json | python3 -c "import sys,json; a=json.load(sys.stdin); print(next(x['uid'] for x in a if x['name']=='grainiac-meeting-processor'))"
 ```
 
-Then spawn each child agent using that environment ID:
+If no such agent config exists, create one once:
+
+```sh
+oz agent create --name grainiac-meeting-processor --team \
+  --environment <ENV_ID> \
+  --secret GRAINIAC_GRAIN_TOKEN \
+  --secret GRAINIAC_NOTION_TOKEN \
+  --secret GRAINIAC_NOTION_DATABASE_ID \
+  --secret GRAINIAC_NOTION_TITLE_PROPERTY \
+  --secret GRAINIAC_INTERNAL_DOMAIN
+```
+
+Then spawn each child agent:
 
 ```sh
 oz agent run-cloud \
+  --agent <AGENT_UID> \
+  --environment <ENV_ID> \
+  --team \
+  --parent-run-id <YOUR_RUN_ID> \
   --prompt 'Read the grainiac-meeting-processor skill in this repo for instructions. Process this meeting:
 RECORDING_ID: <recording_id>
 COMPANY: <company_name>
+NOTION_PAGE_TITLE: <exact existing page title, or "(none found)">
 GRAIN_URL: <grain_url>
 MEETING_TITLE: <title>
 MEETING_DATE: <date>' \
   --environment <ENV_ID>
 ```
+
+Verify the first child comes up with credentials before spawning the rest; a
+whole batch failing on missing secrets is the most common failure mode here.
+
+### Rate limiting
+
+The Grain token is shared by every child. With ~23 requests per rolling window
+and 2 Grain calls per child, launching more than ~10 children at once will 429
+some of them. Launch in groups of about 5, pausing ~60s between groups, and
+tell each child to jitter its first Grain call.
+
+### Map companies to existing Notion pages before spawning
+
+`find_company_page()` matches titles **exactly**, so a child handed a
+domain-derived name creates a duplicate account page instead of updating the
+real one (e.g. `athleticgreens.com` → "Athleticgreens", when the page is
+"AG1"). Before spawning, query the database once, and pass each child the exact
+existing title as `NOTION_PAGE_TITLE`, or `(none found)` when there genuinely
+is no match. Common mismatches: Athleticgreens→AG1, Glovoapp→Glovo,
+Endurancedirect→Endurance, Fetchrewards→Fetch.
 
 ### 4. Monitor
 
