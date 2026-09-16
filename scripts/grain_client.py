@@ -69,12 +69,21 @@ def get_recording(recording_id, include_participants=True, include_ai_summary=Fa
 def get_transcript_text(recording_id):
     """Fetch the full plain-text transcript for a recording."""
     url = f"{BASE_URL}/recordings/{recording_id}/transcript.txt"
-    req = urllib.request.Request(url, headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Grain API {e.code} fetching transcript for {recording_id}: {e.reason}") from e
+    for attempt in range(MAX_RETRIES):
+        req = urllib.request.Request(url, headers=_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < MAX_RETRIES - 1:
+                delay = _retry_after_seconds(e, attempt)
+                print(
+                    f"  Grain API rate limited fetching transcript for {recording_id}; retrying in {delay}s",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"Grain API {e.code} fetching transcript for {recording_id}: {e.reason}") from e
 
 
 def list_recordings_page(cursor=None, include_participants=True, after_datetime=None, before_datetime=None):
