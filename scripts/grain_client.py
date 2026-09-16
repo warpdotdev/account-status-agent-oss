@@ -6,9 +6,16 @@ import urllib.error
 import json
 import os
 import sys
+import time
 from datetime import datetime
 
 BASE_URL = "https://api.grain.com/_/public-api"
+
+# The Grain public API allows roughly 22 requests per rolling window and
+# answers with 429 once that budget is gone. Back off and retry instead of
+# failing the whole run.
+MAX_RETRIES = 5
+INITIAL_BACKOFF_SECONDS = 15
 
 
 def _headers():
@@ -18,14 +25,34 @@ def _headers():
     return {"Authorization": f"Bearer {token}"}
 
 
+def _retry_after_seconds(err, attempt):
+    """Seconds to wait before retrying a rate-limited request."""
+    header = err.headers.get("Retry-After") if err.headers else None
+    if header:
+        try:
+            return max(1, int(float(header)))
+        except ValueError:
+            pass
+    return INITIAL_BACKOFF_SECONDS * (2 ** attempt)
+
+
 def _get(path, timeout=30):
     url = f"{BASE_URL}{path}"
-    req = urllib.request.Request(url, headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Grain API {e.code} on GET {path}: {e.reason}") from e
+    for attempt in range(MAX_RETRIES):
+        req = urllib.request.Request(url, headers=_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < MAX_RETRIES - 1:
+                delay = _retry_after_seconds(e, attempt)
+                print(
+                    f"  Grain API rate limited on GET {path}; retrying in {delay}s",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"Grain API {e.code} on GET {path}: {e.reason}") from e
 
 
 def get_recording(recording_id, include_participants=True, include_ai_summary=False):
@@ -66,8 +93,15 @@ def list_recordings_page(cursor=None, include_participants=True, after_datetime=
     return data.get("recordings", []), data.get("cursor")
 
 
-def list_all_recordings(include_participants=True, after_datetime=None, before_datetime=None, max_pages=100):
-    """Paginate through all recordings matching the filters."""
+def list_all_recordings(include_participants=True, after_datetime=None, before_datetime=None,
+                        max_pages=100, stop_before_date=None):
+    """Paginate through all recordings matching the filters.
+
+    The feed is ordered chronologically descending, so when `stop_before_date`
+    (a YYYY-MM-DD string) is supplied we stop paginating as soon as a page
+    contains a recording that starts before that date. This keeps daily runs
+    well inside the API's rate limit instead of walking the entire history.
+    """
     all_recs = []
     cursor = None
     for _ in range(max_pages):
@@ -79,6 +113,10 @@ def list_all_recordings(include_participants=True, after_datetime=None, before_d
         )
         all_recs.extend(recs)
         if not cursor or not recs:
+            break
+        if stop_before_date and any(
+            (r.get("start_datetime") or "")[:10] < stop_before_date for r in recs
+        ):
             break
     return all_recs
 
