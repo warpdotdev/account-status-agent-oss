@@ -43,7 +43,54 @@ def _api(method, path, body=None):
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
+        if e.code == 404 and "/databases/" in path:
+            raise RuntimeError(_database_404_help(path)) from e
         raise RuntimeError(f"Notion API {e.code} on {method} {path}: {e.reason}") from e
+
+
+def accessible_databases():
+    """List databases the integration can actually see, as (id, title, title_property)."""
+    result = _api("POST", "/search", {
+        "filter": {"value": "database", "property": "object"},
+        "page_size": 20,
+    })
+    found = []
+    for db in result.get("results", []):
+        title = "".join(t.get("plain_text", "") for t in db.get("title", []))
+        title_prop = next(
+            (k for k, v in db.get("properties", {}).items() if v.get("type") == "title"),
+            None,
+        )
+        found.append((db.get("id"), title, title_prop))
+    return found
+
+
+def _database_404_help(path):
+    """A 404 on a database almost always means GRAINIAC_NOTION_DATABASE_ID is stale or
+    the database was never shared with the integration. Say so, and show what IS visible.
+    """
+    msg = [
+        f"Notion API 404 on {path}.",
+        f"GRAINIAC_NOTION_DATABASE_ID={_database_id()!r} is not visible to this integration "
+        "(wrong ID, or the database was never shared with it).",
+    ]
+    try:
+        visible = accessible_databases()
+    except Exception:
+        visible = []
+    if visible:
+        msg.append("Databases this integration CAN see:")
+        for db_id, title, title_prop in visible:
+            msg.append(f"  - {title!r} id={db_id} title property={title_prop!r}")
+        msg.append(
+            "Set GRAINIAC_NOTION_DATABASE_ID (and GRAINIAC_NOTION_TITLE_PROPERTY) to match one of these."
+        )
+    else:
+        msg.append(
+            "This integration cannot see any databases. Share the Account Tracking database "
+            "with it via the Notion UI (Connections → add your integration)."
+        )
+    return "\n".join(msg)
 
 
 # ── Database operations ──
