@@ -5,9 +5,20 @@ import urllib.request
 import urllib.error
 import json
 import os
+import sys
+import time
 
 BASE_URL = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
+
+# Notion allows roughly 3 requests/second per integration token, and that
+# budget is shared by every agent using the same token. A daily run fans out
+# one agent per meeting, so throttling is expected rather than exceptional:
+# retry instead of dying halfway through writing a page.
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+MAX_RETRIES = int(os.environ.get("GRAINIAC_NOTION_MAX_RETRIES", "6"))
+RETRY_BASE_DELAY = float(os.environ.get("GRAINIAC_NOTION_RETRY_BASE_DELAY", "2"))
+REQUEST_DELAY = float(os.environ.get("GRAINIAC_NOTION_REQUEST_DELAY", "0.34"))
 
 
 def _database_id():
@@ -36,14 +47,57 @@ def _headers():
     }
 
 
+def _retry_after_seconds(err, attempt):
+    """Prefer the server's Retry-After hint, else exponential backoff."""
+    header = None
+    if getattr(err, "headers", None):
+        header = err.headers.get("Retry-After")
+    if header:
+        try:
+            return max(1.0, float(header))
+        except ValueError:
+            pass
+    return RETRY_BASE_DELAY * (2 ** attempt)
+
+
 def _api(method, path, body=None):
     data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(f"{BASE_URL}{path}", data=data, headers=_headers(), method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Notion API {e.code} on {method} {path}: {e.reason}") from e
+    what = f"{method} {path}"
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(f"{BASE_URL}{path}", data=data, headers=_headers(), method=method)
+        try:
+            if REQUEST_DELAY:
+                time.sleep(REQUEST_DELAY)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code in RETRY_STATUSES and attempt < MAX_RETRIES:
+                delay = _retry_after_seconds(e, attempt)
+                print(
+                    f"  Notion API {e.code} on {what}; retrying in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{MAX_RETRIES})",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8")[:500]
+            except Exception:
+                pass
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(f"Notion API {e.code} on {what}: {e.reason}{suffix}") from e
+        except urllib.error.URLError as e:
+            if attempt < MAX_RETRIES:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                print(
+                    f"  Network error on {what}: {e.reason}; retrying in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{MAX_RETRIES})",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"Notion API network error on {what}: {e.reason}") from e
 
 
 # ── Database operations ──
