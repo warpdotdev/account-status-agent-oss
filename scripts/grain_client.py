@@ -6,9 +6,20 @@ import urllib.error
 import json
 import os
 import sys
+import time
 from datetime import datetime
 
 BASE_URL = "https://api.grain.com/_/public-api"
+
+# The Grain API rate-limits aggressively, and a daily run can fan out across many
+# concurrent agents. Retry 429s with exponential backoff instead of failing the run.
+MAX_RETRIES = int(os.environ.get("GRAINIAC_GRAIN_MAX_RETRIES", "6"))
+INITIAL_BACKOFF = float(os.environ.get("GRAINIAC_GRAIN_INITIAL_BACKOFF", "5"))
+MAX_BACKOFF = float(os.environ.get("GRAINIAC_GRAIN_MAX_BACKOFF", "60"))
+# Minimum delay between consecutive requests, to avoid tripping the limit at all.
+REQUEST_DELAY = float(os.environ.get("GRAINIAC_GRAIN_REQUEST_DELAY", "0.5"))
+
+_last_request_at = 0.0
 
 
 def _headers():
@@ -18,14 +29,54 @@ def _headers():
     return {"Authorization": f"Bearer {token}"}
 
 
+def _throttle():
+    """Space out consecutive requests by at least REQUEST_DELAY seconds."""
+    global _last_request_at
+    elapsed = time.monotonic() - _last_request_at
+    if elapsed < REQUEST_DELAY:
+        time.sleep(REQUEST_DELAY - elapsed)
+    _last_request_at = time.monotonic()
+
+
+def _retry_after_seconds(err, fallback):
+    """Honor the Retry-After header when the API sends one."""
+    value = err.headers.get("Retry-After") if err.headers else None
+    if value:
+        try:
+            return max(float(value), 0.0)
+        except ValueError:
+            pass
+    return fallback
+
+
+def _request(url, timeout, description, decode_json=True):
+    """Perform a GET with throttling and 429 backoff."""
+    backoff = INITIAL_BACKOFF
+    for attempt in range(MAX_RETRIES + 1):
+        _throttle()
+        req = urllib.request.Request(url, headers=_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read()
+                return json.loads(body) if decode_json else body.decode("utf-8")
+        except urllib.error.HTTPError as e:
+            retryable = e.code == 429 or 500 <= e.code < 600
+            if retryable and attempt < MAX_RETRIES:
+                wait = _retry_after_seconds(e, backoff)
+                print(
+                    f"  Grain API {e.code} on {description}; "
+                    f"retrying in {wait:.0f}s (attempt {attempt + 1}/{MAX_RETRIES})",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+                continue
+            raise RuntimeError(f"Grain API {e.code} on {description}: {e.reason}") from e
+    raise RuntimeError(f"Grain API kept rate-limiting {description} after {MAX_RETRIES} retries")
+
+
 def _get(path, timeout=30):
-    url = f"{BASE_URL}{path}"
-    req = urllib.request.Request(url, headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Grain API {e.code} on GET {path}: {e.reason}") from e
+    return _request(f"{BASE_URL}{path}", timeout, f"GET {path}")
 
 
 def get_recording(recording_id, include_participants=True, include_ai_summary=False):
@@ -42,12 +93,12 @@ def get_recording(recording_id, include_participants=True, include_ai_summary=Fa
 def get_transcript_text(recording_id):
     """Fetch the full plain-text transcript for a recording."""
     url = f"{BASE_URL}/recordings/{recording_id}/transcript.txt"
-    req = urllib.request.Request(url, headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Grain API {e.code} fetching transcript for {recording_id}: {e.reason}") from e
+    return _request(
+        url,
+        timeout=60,
+        description=f"transcript for {recording_id}",
+        decode_json=False,
+    )
 
 
 def list_recordings_page(cursor=None, include_participants=True, after_datetime=None, before_datetime=None):
@@ -66,8 +117,20 @@ def list_recordings_page(cursor=None, include_participants=True, after_datetime=
     return data.get("recordings", []), data.get("cursor")
 
 
-def list_all_recordings(include_participants=True, after_datetime=None, before_datetime=None, max_pages=100):
-    """Paginate through all recordings matching the filters."""
+def list_all_recordings(
+    include_participants=True,
+    after_datetime=None,
+    before_datetime=None,
+    max_pages=100,
+    stop_before_date=None,
+):
+    """Paginate through all recordings matching the filters.
+
+    Pages come back in reverse-chronological order. When `stop_before_date`
+    (a `YYYY-MM-DD` string) is given, pagination stops as soon as an entire page
+    predates it. That keeps a single-day fetch to a couple of requests instead of
+    walking the full history and tripping the API's rate limit.
+    """
     all_recs = []
     cursor = None
     for _ in range(max_pages):
@@ -80,6 +143,10 @@ def list_all_recordings(include_participants=True, after_datetime=None, before_d
         all_recs.extend(recs)
         if not cursor or not recs:
             break
+        if stop_before_date:
+            dates = [r.get("start_datetime", "")[:10] for r in recs if r.get("start_datetime")]
+            if dates and max(dates) < stop_before_date:
+                break
     return all_recs
 
 
