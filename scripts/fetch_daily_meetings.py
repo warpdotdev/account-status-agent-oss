@@ -11,7 +11,8 @@ Outputs JSON array of meetings to stdout. Requires GRAINIAC_GRAIN_TOKEN env var.
 import sys
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Allow importing from same directory
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
@@ -21,23 +22,24 @@ from grain_client import list_all_recordings, filter_external_meetings, hydrate_
 # business timezone so that an evening Pacific run captures the right day.
 # Set via GRAINIAC_TIMEZONE env var. Default: America/Los_Angeles (Pacific).
 #
-# We use a simple UTC offset lookup instead of pytz to stay stdlib-only.
-# This handles PST/PDT well enough for daily batch runs.
-TZ_OFFSETS = {
-    "America/Los_Angeles": -8,  # PST (close enough; PDT is -7)
-    "America/New_York": -5,
-    "America/Chicago": -6,
-    "America/Denver": -7,
-    "US/Pacific": -8,
-    "US/Eastern": -5,
-    "UTC": 0,
-}
+# zoneinfo is stdlib (3.9+) and handles DST transitions correctly, which a
+# fixed UTC offset does not: Pacific is -7 (PDT) for most of the year and -8
+# (PST) only in winter, so a hardcoded -8 resolves the wrong calendar date for
+# runs in the hour before midnight during daylight saving time.
+DEFAULT_TIMEZONE = "America/Los_Angeles"
 
 
 def _resolve_today():
-    tz_name = os.environ.get("GRAINIAC_TIMEZONE", "America/Los_Angeles")
-    offset_hours = TZ_OFFSETS.get(tz_name, -8)
-    tz = timezone(timedelta(hours=offset_hours))
+    tz_name = os.environ.get("GRAINIAC_TIMEZONE", DEFAULT_TIMEZONE)
+    try:
+        tz = ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        print(
+            f"Warning: unknown timezone {tz_name!r}; falling back to {DEFAULT_TIMEZONE}",
+            file=sys.stderr,
+        )
+        tz_name = DEFAULT_TIMEZONE
+        tz = ZoneInfo(tz_name)
     return datetime.now(tz).date(), tz_name
 
 
@@ -55,10 +57,12 @@ def main():
 
     target_str = str(target)
 
-    # Grain API date params are unreliable, so we fetch all recent recordings
-    # and filter client-side by date.
+    # Grain API date params are unreliable, so we fetch recent recordings and
+    # filter client-side by date. The list comes back newest-first, so we stop
+    # paging as soon as we see anything older than the target date — the
+    # request budget is too small to walk the whole history.
     print(f"Fetching recordings for {target}...", file=sys.stderr)
-    recordings = list_all_recordings(include_participants=True)
+    recordings = list_all_recordings(include_participants=True, stop_before_date=target_str)
     print(f"Fetched {len(recordings)} total recordings", file=sys.stderr)
 
     # Filter to target date
