@@ -55,6 +55,13 @@ If there is only **one meeting** to process, handle it inline instead of spawnin
 
 If there are **multiple meetings**, spawn a child cloud agent for each one.
 
+**Before spawning, confirm the child agents will actually have credentials.** Child runs only
+see `GRAINIAC_GRAIN_TOKEN`, `GRAINIAC_NOTION_TOKEN` and `GRAINIAC_NOTION_DATABASE_ID` if those
+secrets are attached to the environment they run in — they are not inherited from the
+orchestrator run. If the orchestrator received them from its schedule config rather than from the
+environment, children will start up with nothing and stall. Attach the secrets to the `grainiac`
+environment, or process the meetings inline in the orchestrator run instead of spawning.
+
 First, discover the environment ID by looking up the "grainiac" environment:
 
 ```sh
@@ -87,5 +94,7 @@ Check run status in the Oz web app at https://oz.warp.dev/runs (each `oz agent r
 
 - **Timezone handling:** Grain timestamps are UTC. When the script resolves `today`, it uses the `GRAINIAC_TIMEZONE` env var (default: `America/Los_Angeles`) to determine the correct calendar date. This matters for evening Pacific runs where UTC has already rolled to the next day. You can override with `GRAINIAC_TIMEZONE=UTC` or any supported timezone. When a specific `YYYY-MM-DD` date is provided, the script matches recordings whose UTC `start_datetime` falls on that calendar date.
 - The Grain API's `title_search` parameter does not filter server-side. Filtering happens client-side in `grain_client.py`.
+- **Rate limits:** Grain returns HTTP 429 readily. `grain_client.py` retries transient failures with exponential backoff, and the daily fetch stops paginating once it is past the target date instead of walking the whole account history.
+- **Empty transcripts:** A no-show produces a short recording with no transcript. Record it as a no-show rather than inferring meeting content; check `duration_ms` and the participant's `confirmed_attendee` flag on the recording to confirm.
 - Company names are inferred from external participant email domains. If the inferred name is wrong (e.g., "Gmail" for a personal email), the child agent should correct it during analysis.
 - The Grain API paginates at 20 recordings per page. For busy days, the fetch script handles up to 100 pages automatically.
