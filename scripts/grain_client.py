@@ -6,9 +6,18 @@ import urllib.error
 import json
 import os
 import sys
+import time
 from datetime import datetime
 
 BASE_URL = "https://api.grain.com/_/public-api"
+
+# The Grain API rate limits aggressively, and a daily run can issue hundreds of
+# requests (one per page of recordings, plus two per recording when hydrating).
+# Without backoff a single 429 aborts the whole pipeline, so every request goes
+# through _request() below.
+REQUEST_DELAY_SECONDS = 1.0
+MAX_ATTEMPTS = 6
+BACKOFF_SECONDS = [5, 15, 30, 60, 120]
 
 
 def _headers():
@@ -18,14 +27,41 @@ def _headers():
     return {"Authorization": f"Bearer {token}"}
 
 
-def _get(path, timeout=30):
+def _request(path, timeout, decode_json):
+    """Issue a GET against the Grain API, retrying on HTTP 429.
+
+    Honours the Retry-After header when present, otherwise falls back to
+    exponential backoff. Raises RuntimeError on any other HTTP error, or once
+    the retry budget is exhausted.
+    """
     url = f"{BASE_URL}{path}"
     req = urllib.request.Request(url, headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Grain API {e.code} on GET {path}: {e.reason}") from e
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            time.sleep(REQUEST_DELAY_SECONDS)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                return json.loads(raw) if decode_json else raw.decode("utf-8")
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or attempt == MAX_ATTEMPTS - 1:
+                raise RuntimeError(f"Grain API {e.code} on GET {path}: {e.reason}") from e
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            try:
+                wait = int(retry_after)
+            except (TypeError, ValueError):
+                wait = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
+            print(
+                f"  Grain API rate limited on {path}; retrying in {wait}s "
+                f"(attempt {attempt + 1}/{MAX_ATTEMPTS})",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(wait)
+    raise RuntimeError(f"Grain API still rate limited after {MAX_ATTEMPTS} attempts: {path}")
+
+
+def _get(path, timeout=30):
+    return _request(path, timeout, decode_json=True)
 
 
 def get_recording(recording_id, include_participants=True, include_ai_summary=False):
@@ -40,14 +76,12 @@ def get_recording(recording_id, include_participants=True, include_ai_summary=Fa
 
 
 def get_transcript_text(recording_id):
-    """Fetch the full plain-text transcript for a recording."""
-    url = f"{BASE_URL}/recordings/{recording_id}/transcript.txt"
-    req = urllib.request.Request(url, headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Grain API {e.code} fetching transcript for {recording_id}: {e.reason}") from e
+    """Fetch the full plain-text transcript for a recording.
+
+    Returns an empty string for recordings Grain has no transcript for (for
+    example, a recording that was started and immediately abandoned).
+    """
+    return _request(f"/recordings/{recording_id}/transcript.txt", 60, decode_json=False)
 
 
 def list_recordings_page(cursor=None, include_participants=True, after_datetime=None, before_datetime=None):
@@ -128,7 +162,7 @@ def hydrate_with_participants(recordings):
             if not r.get("summary"):
                 r["summary"] = full.get("summary", "")
         except Exception as e:
-            print(f"  Warning: failed to hydrate {r['id']}: {e}", file=__import__('sys').stderr)
+            print(f"  Warning: failed to hydrate {r['id']}: {e}", file=sys.stderr)
             r["participants"] = []
         hydrated.append(r)
     return hydrated
