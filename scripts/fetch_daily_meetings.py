@@ -55,11 +55,22 @@ def main():
 
     target_str = str(target)
 
-    # Grain API date params are unreliable, so we fetch all recent recordings
-    # and filter client-side by date.
-    print(f"Fetching recordings for {target}...", file=sys.stderr)
-    recordings = list_all_recordings(include_participants=True)
-    print(f"Fetched {len(recordings)} total recordings", file=sys.stderr)
+    # Bound the query to a window around the target date rather than walking the
+    # entire recording history. Grain paginates at 20 recordings per page, so an
+    # unbounded listing issues hundreds of requests and reliably trips the API's
+    # rate limit. A one-day margin on each side absorbs any timezone skew in the
+    # server-side filter; we still filter client-side by UTC date below.
+    after = f"{target - timedelta(days=1)}T00:00:00Z"
+    before = f"{target + timedelta(days=2)}T00:00:00Z"
+
+    print(f"Fetching recordings between {after} and {before}...", file=sys.stderr)
+    recordings = list_all_recordings(
+        include_participants=True,
+        after_datetime=after,
+        before_datetime=before,
+        max_pages=20,
+    )
+    print(f"Fetched {len(recordings)} recordings in window", file=sys.stderr)
 
     # Filter to target date
     day_recordings = [
