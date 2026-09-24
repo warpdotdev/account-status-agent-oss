@@ -61,18 +61,42 @@ First, discover the environment ID by looking up the "grainiac" environment:
 oz environment list --output-format json | python3 -c "import sys,json; envs=json.load(sys.stdin); print(next(e['id'] for e in envs if e['name']=='grainiac'))"
 ```
 
-Then spawn each child agent using that environment ID:
+Next, look up the `grainiac-meeting-processor` **agent identity**. Child agents must run as
+this identity or they will have no credentials — see the warning below.
+
+```sh
+oz agent list --output-format json | python3 -c "import sys,json; a=json.load(sys.stdin)['agents']; print(next(x['uid'] for x in a if x['name']=='grainiac-meeting-processor'))"
+```
+
+Then spawn each child agent with both the environment and the agent identity:
 
 ```sh
 oz agent run-cloud \
+  --agent <AGENT_UID> \
+  --environment <ENV_ID> \
+  --parent-run-id <YOUR_RUN_ID> \
   --prompt 'Read the grainiac-meeting-processor skill in this repo for instructions. Process this meeting:
 RECORDING_ID: <recording_id>
 COMPANY: <company_name>
 GRAIN_URL: <grain_url>
 MEETING_TITLE: <title>
-MEETING_DATE: <date>' \
-  --environment <ENV_ID>
+MEETING_DATE: <date>'
 ```
+
+> **`--agent` is required, not optional.** The `GRAINIAC_*` secrets are attached *per run*,
+> through `agent_config.secrets` — not by the environment. The orchestrator run gets them
+> because the schedule supplies them, but a child spawned with only `--environment` is
+> created with an empty secret list and every `GRAINIAC_*` variable will be unset. The child
+> then fails immediately with `GRAINIAC_GRAIN_TOKEN environment variable is required`.
+> There is no CLI flag or `--file` config key for attaching secrets to a run, so running as
+> an identity that already holds them is the supported path.
+>
+> Never work around this by passing secret values in the prompt or in messages to children.
+> That copies live tokens into agent transcripts. If the identity is missing or lacks a
+> secret, fix the identity instead.
+>
+> To verify a child's credentials without exposing them, check that the run config lists the
+> secret names: `oz run get <RUN_ID> --output-format json` and look at `agent_config.secrets`.
 
 ### 4. Monitor
 
